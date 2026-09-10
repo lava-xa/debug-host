@@ -79,7 +79,7 @@ class App(tk.Tk):
         # group this GUI with the terminal/Codex process that launched it.
         super().__init__(className="AeroHandControl")
         self._configure_fonts()
-        self.title("TetherIA – Aero Hand Open 灵巧手控制器")
+        self.title("TetherIA – Aero Hand 电机上位机 by lava")
         self.geometry("900x620")
         self.minsize(860, 560)
         if sys.platform.startswith("win"):
