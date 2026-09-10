@@ -31,21 +31,25 @@ A simple Tkinter GUI to control the TetherIA Aero Hand via serial port:
 """
 import sys
 import os
+import queue
 import threading
 import time
 import subprocess
+import shutil
+import tempfile
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, messagebox, simpledialog, filedialog
 
 from serial.tools import list_ports
 
-from aero_open_sdk.aero_hand import AeroHand
+from aero_hand import AeroHand
 
 
 # ---- operation codes ------------
 HOMING_MODE = 0x01
-SET_ID_MODE = 0x03
-TRIM_MODE   = 0x04
+SET_ID_MODE = 0x02
+TRIM_MODE   = 0x03
 
 CTRL_POS = 0x11
 
@@ -71,7 +75,10 @@ SLIDER_LABELS = [
 
 class App(tk.Tk):
     def __init__(self):
-        super().__init__()
+        # Use a dedicated X11 window class so desktop environments do not
+        # group this GUI with the terminal/Codex process that launched it.
+        super().__init__(className="AeroHandControl")
+        self._configure_fonts()
         self.title("TetherIA – Aero Hand Open 灵巧手控制器")
         self.geometry("900x620")
         self.minsize(860, 560)
@@ -84,9 +91,22 @@ class App(tk.Tk):
             self.attributes("-zoomed", True)
 
         try:
-            icon_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "logo.png")
-            icon_img = tk.PhotoImage(file=icon_path)
-            self.iconphoto(True, icon_img)
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+            icon_source = tk.PhotoImage(file=icon_path)
+
+            # Tk/X11 on this system rejects _NET_WM_ICON when any supplied
+            # image is larger than 128px, so only publish desktop-safe sizes.
+            source_size = max(icon_source.width(), icon_source.height())
+            scale_factors = {
+                max(1, round(source_size / target_size))
+                for target_size in (128, 64, 48, 32, 16)
+            }
+            self.icon_images = [
+                icon_source.subsample(factor, factor)
+                for factor in sorted(scale_factors)
+            ]
+            # Keep all PhotoImage objects for the lifetime of the window.
+            self.iconphoto(True, *self.icon_images)
         except Exception as e:
             print(f"无法设置窗口图标：{e}")
 
@@ -94,14 +114,132 @@ class App(tk.Tk):
         self.hand: AeroHand | None = None
         self.tx_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
+        self._main_thread = threading.current_thread()
+        self._ui_queue = queue.Queue()
         self.control_paused = False  # pause streaming during blocking ops
         self.tx_rate_hz = 50.0       # streaming rate for CTRL_POS
         self.slider_vars: list[tk.DoubleVar] = []  # Use DoubleVar for normalized 0.0-1.0 range
+        self.slider_values = [0.0] * 7
         self.port_var = tk.StringVar()
         self.baud_var = tk.IntVar(value=921600)
 
         self._build_ui()
         self._refresh_ports()
+        self.after(25, self._drain_ui_queue)
+
+    def _configure_fonts(self):
+        """为不同操作系统选择清晰的中文字体。"""
+        self._register_linux_cjk_font()
+        available_families = {
+            family.casefold(): family for family in tkfont.families(self)
+        }
+
+        if sys.platform.startswith("win"):
+            ui_candidates = (
+                "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Segoe UI"
+            )
+        elif sys.platform == "darwin":
+            ui_candidates = (
+                "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Helvetica Neue"
+            )
+        else:
+            ui_candidates = (
+                "Noto Sans CJK SC", "WenQuanYi Micro Hei", "Droid Sans Fallback", "DejaVu Sans"
+            )
+
+        mono_candidates = (
+            "Noto Sans Mono CJK SC", "WenQuanYi Micro Hei Mono", "Microsoft YaHei UI",
+            "PingFang SC", "Consolas", "DejaVu Sans Mono"
+        )
+
+        default_family = tkfont.nametofont("TkDefaultFont").actual("family")
+        self.ui_font_family = next(
+            (
+                available_families[family.casefold()]
+                for family in ui_candidates
+                if family.casefold() in available_families
+            ),
+            default_family,
+        )
+        self.mono_font_family = next(
+            (
+                available_families[family.casefold()]
+                for family in mono_candidates
+                if family.casefold() in available_families
+            ),
+            self.ui_font_family,
+        )
+
+        font_sizes = {
+            "TkDefaultFont": 11,
+            "TkTextFont": 11,
+            "TkMenuFont": 11,
+            "TkHeadingFont": 11,
+            "TkCaptionFont": 11,
+            "TkSmallCaptionFont": 10,
+            "TkIconFont": 11,
+            "TkTooltipFont": 10,
+        }
+        for font_name, font_size in font_sizes.items():
+            try:
+                tkfont.nametofont(font_name).configure(
+                    family=self.ui_font_family,
+                    size=font_size,
+                )
+            except tk.TclError:
+                pass
+
+        try:
+            tkfont.nametofont("TkFixedFont").configure(
+                family=self.mono_font_family,
+                size=10,
+            )
+        except tk.TclError:
+            pass
+
+        # ttk 组件和下拉列表有各自的字体设置，需要单独统一。
+        ttk.Style(self).configure(".", font=(self.ui_font_family, 11))
+        self.option_add("*TCombobox*Listbox.font", (self.ui_font_family, 11))
+
+    def _register_linux_cjk_font(self):
+        """为未启用 Fontconfig 的 Linux Tk 注册中文无衬线字体。"""
+        if not sys.platform.startswith("linux") or not os.environ.get("DISPLAY"):
+            return
+
+        current_families = {
+            family.casefold() for family in tkfont.families(self)
+        }
+        if "wenquanyi micro hei" in current_families:
+            return
+
+        font_candidates = (
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
+        )
+        font_path = next((path for path in font_candidates if os.path.isfile(path)), None)
+        if not font_path:
+            return
+        if not all(shutil.which(command) for command in ("mkfontscale", "mkfontdir", "xset")):
+            return
+
+        try:
+            cache_dir = os.path.join(
+                tempfile.gettempdir(),
+                f"aero-open-gui-fonts-{os.getuid()}",
+            )
+            os.makedirs(cache_dir, exist_ok=True)
+            font_link = os.path.join(cache_dir, "wqy-microhei.ttc")
+            if not os.path.exists(font_link):
+                os.symlink(font_path, font_link)
+
+            quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+            subprocess.run(["mkfontscale", cache_dir], check=True, **quiet)
+            subprocess.run(["mkfontdir", cache_dir], check=True, **quiet)
+            subprocess.run(["xset", "+fp", cache_dir], check=True, **quiet)
+            subprocess.run(["xset", "fp", "rehash"], check=True, **quiet)
+        except (OSError, subprocess.CalledProcessError):
+            # 字体注册失败时仍可使用 Tk 默认字体启动程序。
+            pass
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -180,7 +318,7 @@ class App(tk.Tk):
 
         self.slider_vars = []
         self.slider_widgets = []
-        mono_font = ("Consolas", 10)
+        mono_font = (self.mono_font_family, 10)
         for i, name in enumerate(SLIDER_LABELS):
             row = ttk.Frame(self.grp)
             row.pack(fill=tk.X, pady=5)
@@ -190,7 +328,8 @@ class App(tk.Tk):
             var = tk.DoubleVar(value=0.0)
             self.slider_vars.append(var)
             scale = tk.Scale(row, from_=0.0, to=1.0, orient=tk.HORIZONTAL, length=600,
-                              resolution=0.001, variable=var, showvalue=True, font=mono_font)
+                              resolution=0.001, variable=var, showvalue=True, font=mono_font,
+                              command=lambda value, index=i: self._on_position_slider(index, value))
             scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6))
             self.slider_widgets.append(scale)
             max_lbl = ttk.Label(row, text="1.000", width=8, font=mono_font)
@@ -208,13 +347,15 @@ class App(tk.Tk):
         self.torque_frame.pack_forget()
 
         # Torque Control Button below sliders
-        self.btn_torque_control = ttk.Button(self, text="扭矩控制", command=self.on_torque_control, state=tk.NORMAL)
+        self.btn_torque_control = ttk.Button(
+            self, text="扭矩控制", command=self.on_torque_control, state=tk.DISABLED
+        )
         self.btn_torque_control.pack(side=tk.TOP, pady=(0, 10))
 
         # ---- RX log
         rx = ttk.LabelFrame(self, text="收发日志", padding=10)
         rx.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-        self.rx_text = tk.Text(rx, height=10)
+        self.rx_text = tk.Text(rx, height=10, font=(self.mono_font_family, 10))
         self.rx_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb = ttk.Scrollbar(rx, command=self.rx_text.yview)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -231,26 +372,93 @@ class App(tk.Tk):
 
     # ------------- helpers -------------
     def log(self, s: str):
+        if threading.current_thread() is not self._main_thread:
+            self._ui_queue.put(("log", s))
+            return
+        self._append_log(s)
+
+    def _append_log(self, s: str):
         self.rx_text.insert(tk.END, s + ("\n" if not s.endswith("\n") else ""))
         self.rx_text.see(tk.END)
 
     def set_status(self, s: str):
+        if threading.current_thread() is not self._main_thread:
+            self._ui_queue.put(("status", s))
+            return
         self.status_var.set(s)
 
+    def call_in_ui(self, callback):
+        if threading.current_thread() is self._main_thread:
+            callback()
+        else:
+            self._ui_queue.put(("call", callback))
+
+    def _drain_ui_queue(self):
+        try:
+            while True:
+                action, value = self._ui_queue.get_nowait()
+                if action == "log":
+                    self._append_log(value)
+                elif action == "status":
+                    self.status_var.set(value)
+                elif action == "call":
+                    value()
+        except queue.Empty:
+            pass
+        try:
+            self.after(25, self._drain_ui_queue)
+        except tk.TclError:
+            pass
+
+    def _on_position_slider(self, index: int, value: str):
+        self.slider_values[index] = float(value)
+
+    @staticmethod
+    def _port_rank(port):
+        identity = " ".join(
+            str(value or "")
+            for value in (port.device, port.description, port.manufacturer, port.hwid)
+        ).lower()
+        if (
+            (port.vid, port.pid) == (0x303A, 0x1001)
+            or "espressif" in identity
+            or "usb jtag/serial debug unit" in identity
+        ):
+            return 0
+        device = port.device.lower()
+        if "ttyacm" in device:
+            return 1
+        if "ttyusb" in device:
+            return 2
+        if device.startswith("com"):
+            return 3
+        if "ttys" in device:
+            return 20
+        return 10
+
     def _refresh_ports(self):
-        ports = [p.device for p in list_ports.comports()]
-        self.port_cmb["values"] = ports
-        # auto-select the first port if none chosen
-        if ports and self.port_var.get() not in ports:
-            self.port_var.set(ports[0])
-        if not ports and not self.port_var.get():
-            # plausible defaults
-            if sys.platform.startswith("win"):
-                self.port_var.set("COM12")
-            else:
-                self.port_var.set("/dev/ttyUSB0")
+        ports = sorted(list_ports.comports(), key=self._port_rank)
+        devices = [port.device for port in ports]
+        self.port_cmb["values"] = devices
+
+        if not ports:
+            self.port_var.set("")
+            self.set_status("未检测到可用串口")
+            return
+
+        preferred = ports[0]
+        current = self.port_var.get()
+        if current not in devices or self._port_rank(preferred) == 0:
+            self.port_var.set(preferred.device)
+
+        if self._port_rank(preferred) == 0:
+            self.set_status(f"已检测到 ESP32：{preferred.device}")
+        else:
+            self.set_status("未识别到 ESP32，请检查 USB 连接")
 
     def on_torque_control(self):
+        if not self.hand:
+            return
         # Stop CTRL_POS streaming and disable joint sliders
         self.control_paused = True
         self.set_status("已进入扭矩控制模式，CTRL_POS 位置数据发送已停止")
@@ -262,6 +470,8 @@ class App(tk.Tk):
         self.torque_slider.configure(state=tk.NORMAL)
 
     def _on_torque_slider(self, val):
+        if not self.hand:
+            return
         t_val = int(float(val) * 1000)
         try:
             self.hand.ctrl_torque([t_val]*7)
@@ -296,8 +506,29 @@ class App(tk.Tk):
             return False
 
         baud = int(self.baud_var.get())
+        candidate = None
         try:
-            self.hand = AeroHand(port, baudrate=baud)
+            self.set_status(f"正在连接 {port}…")
+            self.update_idletasks()
+            candidate = AeroHand(port, baudrate=baud)
+            capabilities = candidate.get_capabilities(timeout_s=2.0)
+
+            # Match the sliders to the current hand pose before streaming so
+            # connecting does not cause an unexpected jump to zero.
+            current_joints = candidate.get_joint_positions_compact()
+            if len(current_joints) != 7:
+                raise RuntimeError("固件返回了无效的关节位置数据")
+            normalized = []
+            for index, value in enumerate(current_joints):
+                lower = candidate.joint_lower_limits[index]
+                upper = candidate.joint_upper_limits[index]
+                ratio = (value - lower) / (upper - lower)
+                normalized.append(max(0.0, min(1.0, ratio)))
+            self.slider_values = normalized
+            for var, value in zip(self.slider_vars, normalized):
+                var.set(value)
+
+            self.hand = candidate
 
             self.stop_event.clear()
             self.tx_thread = threading.Thread(target=self._tx_loop, daemon=True)
@@ -305,16 +536,30 @@ class App(tk.Tk):
 
             self.btn_connect.configure(state=tk.DISABLED)
             self.btn_disc.configure(state=tk.NORMAL)
-            for b in (self.btn_zero,self.btn_homing, self.btn_setid, self.btn_trim,self.btn_set_speed,self.btn_set_torque,
+            for b in (self.btn_zero, self.btn_homing, self.btn_setid, self.btn_trim,
+                      self.btn_set_speed, self.btn_set_torque, self.btn_torque_control,
                       self.btn_get_pos, self.btn_get_vel, self.btn_get_cur, self.btn_get_temp, self.btn_get_all):
                 b.configure(state=tk.NORMAL)
 
-            self.set_status(f"已连接到 {port}，波特率 {baud}")
-            self.log(f"[信息] 已连接 {port}，波特率 {baud}")
+            protocol_version = capabilities["protocol_version"]
+            self.set_status(f"已连接 ESP32（固件协议 v{protocol_version}）：{port}")
+            self.log(f"[信息] ESP32 通信验证通过：{port}，波特率 {baud}")
+            self.log(f"[信息] 固件协议版本：{protocol_version}")
             return True  # Success!
         except Exception as e:
+            if candidate is not None:
+                try:
+                    candidate.close()
+                except Exception:
+                    pass
             self.hand = None
-            messagebox.showerror("连接失败", str(e))
+            detail = (
+                f"已打开串口 {port}，但未收到 Aero Hand 固件应答。\n\n"
+                f"详细信息：{e}\n\n"
+                "请确认选中的是 ESP32 串口，并且已烧录 firmware_new 固件。"
+            )
+            self.set_status("连接失败：ESP32 固件无应答")
+            messagebox.showerror("连接失败", detail)
             return False  # Failure
 
     def on_disconnect(self):
@@ -339,7 +584,8 @@ class App(tk.Tk):
 
         self.btn_connect.configure(state=tk.NORMAL)
         self.btn_disc.configure(state=tk.DISABLED)
-        for b in (self.btn_zero,self.btn_homing, self.btn_setid, self.btn_trim,self.btn_set_speed,self.btn_set_torque,
+        for b in (self.btn_zero, self.btn_homing, self.btn_setid, self.btn_trim,
+                  self.btn_set_speed, self.btn_set_torque, self.btn_torque_control,
                   self.btn_get_pos, self.btn_get_vel, self.btn_get_cur, self.btn_get_temp, self.btn_get_all):
             b.configure(state=tk.DISABLED)
         self.set_status("未连接")
@@ -354,7 +600,11 @@ class App(tk.Tk):
                 # ## Unnormalize to joint limits
                 j_ll = self.hand.joint_lower_limits
                 j_ul = self.hand.joint_upper_limits
-                joint_values = [j_ll[i] + (j_ul[i] - j_ll[i]) * self.slider_vars[i].get() for i in range(7)]
+                slider_values = list(self.slider_values)
+                joint_values = [
+                    j_ll[i] + (j_ul[i] - j_ll[i]) * slider_values[i]
+                    for i in range(7)
+                ]
                 try:
                     self.hand.set_joint_positions(joint_values)
                 except Exception as e:
@@ -451,7 +701,7 @@ class App(tk.Tk):
         if ch is None:
             return
         torque = simpledialog.askinteger("设置扭矩", "扭矩（0..1000）：",
-                                        minvalue=0, maxvalue=1000, initialvalue=1023, parent=self)
+                                        minvalue=0, maxvalue=1000, initialvalue=1000, parent=self)
         if torque is None:
             return
 
@@ -475,11 +725,13 @@ class App(tk.Tk):
         if not self.hand:
             return
 
+        self.slider_values = [0.0] * 7
+        for var in self.slider_vars:
+            var.set(0.0)
+
         def worker():
             try:
                 self.control_paused = True
-                for var in self.slider_vars:
-                    var.set(0.0)  # Set to 0.0 for normalized slider
                 joint_pos = list(self.hand.joint_lower_limits)
                 self.hand.set_joint_positions(joint_pos)
                 self.log("[发送] 通过 CTRL_POS 执行 ZERO_ALL（关节下限）")
@@ -572,7 +824,12 @@ class App(tk.Tk):
             vel = self.hand.get_actuator_speeds()
             curr = self.hand.get_actuator_currents()
             temp = self.hand.get_actuator_temperatures()
-            norm_pos = [round(v / 65535, 3) for v in pos]  # Normalize for display
+            lower = self.hand.actuation_lower_limits
+            upper = self.hand.actuation_upper_limits
+            norm_pos = [
+                round((pos[i] - lower[i]) / (upper[i] - lower[i]), 3)
+                for i in range(7)
+            ]
             self.log(f"[GET_ALL] 位置：{norm_pos} | 速度：{list(vel)} | 电流：{list(curr)} | 温度：{list(temp)}")
         except Exception as e:
             self.log(f"[错误] GET_ALL：{e}")
@@ -609,13 +866,13 @@ class App(tk.Tk):
                 rc = proc.wait()
                 if rc == 0:
                     self.log("[烧录] 固件烧录完成。")
-                    self.after(0, lambda: messagebox.showinfo("成功", "固件烧录成功。"))
+                    self.call_in_ui(lambda: messagebox.showinfo("成功", "固件烧录成功。"))
                 else:
                     self.log(f"[烧录] esptool 退出码：{rc}")
-                    self.after(0, lambda rc=rc: messagebox.showerror("烧录失败", f"esptool 退出码：{rc}"))
+                    self.call_in_ui(lambda rc=rc: messagebox.showerror("烧录失败", f"esptool 退出码：{rc}"))
             except Exception as e:
                 self.log(f"[烧录错误] {e}")
-                self.after(0, lambda e=e: messagebox.showerror("烧录失败", str(e)))
+                self.call_in_ui(lambda e=e: messagebox.showerror("烧录失败", str(e)))
 
             max_attempts = 3
             for attempt in range(1, max_attempts + 1):
@@ -632,7 +889,7 @@ class App(tk.Tk):
                         result['ok'] = False
                     finally:
                         done.set()
-                self.after(0, _do_connect)
+                self.call_in_ui(_do_connect)
                 if not done.wait(3.0): 
                     self.log("[烧录] 重新连接超时")
                     continue                   
@@ -640,8 +897,11 @@ class App(tk.Tk):
                     self.log("[烧录] 已重新连接 ✅")
                     break                     
             else:
-                self.after(0, lambda: self.set_status("固件烧录后重新连接失败"))
-                self.after(0, lambda: messagebox.showerror("重新连接失败", "固件烧录完成，但无法重新连接串口。"))
+                self.set_status("固件烧录后重新连接失败")
+                self.call_in_ui(lambda: messagebox.showerror(
+                    "重新连接失败",
+                    "固件烧录完成，但无法重新连接串口。",
+                ))
 
         threading.Thread(target=worker, daemon=True).start()
 

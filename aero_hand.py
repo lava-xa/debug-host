@@ -16,6 +16,7 @@
 import os
 import time 
 import struct
+import threading
 from serial import Serial, SerialTimeoutException
 from typing import Iterator
 
@@ -38,6 +39,7 @@ GET_POS = 0x22
 GET_VEL = 0x23
 GET_CURR = 0x24
 GET_TEMP = 0x25
+GET_CAPS = 0x26
 
 ## Setting Modes
 SET_SPE = 0x31
@@ -54,7 +56,22 @@ class AeroHand:
         if port is None:
             print("No port specified. Attempting to auto-detect Aero Hand serial port...")
             port = self._detect_port()
-        self.ser = Serial(port, baudrate, timeout=0.01, write_timeout=0.01)
+        self._serial_lock = threading.RLock()
+        self.ser = Serial(
+            port=None,
+            baudrate=baudrate,
+            timeout=0.1,
+            write_timeout=0.25,
+        )
+        # Avoid leaving the ESP32-S3 USB serial interface in reset/boot mode.
+        self.ser.dtr = False
+        self.ser.rts = False
+        self.ser.port = port
+        self.ser.open()
+
+        # Opening the native USB CDC port can reset the ESP32.  Give the
+        # firmware time to reach its 16-byte host protocol loop.
+        time.sleep(0.8)
 
         ## Clean Buffers before starting
         self.ser.reset_input_buffer()
@@ -224,14 +241,34 @@ class AeroHand:
             return
 
     def _wait_for_ack(self, opcode: int, timeout_s: float) -> bytes:
+        frame = self._read_frame(opcode, timeout_s)
+        return frame[2:]
+
+    def _read_frame(self, opcode: int, timeout_s: float) -> bytes:
+        """Read one matching 16-byte frame, skipping ESP32 boot text/noise."""
         deadline = time.monotonic() + timeout_s
+        buffered = bytearray()
+        marker = bytes((opcode & 0xFF, 0x00))
         while time.monotonic() < deadline:
-            frame = self.ser.read(16)
-            if len(frame) != 16:
-                continue 
-            if frame[0] == (opcode & 0xFF) and frame[1] == 0x00:
-                return frame[2:]
-        raise TimeoutError(f"ACK (opcode 0x{opcode:02X}) not received within {timeout_s}s")
+            waiting = self.ser.in_waiting
+            chunk = self.ser.read(max(16, waiting))
+            if not chunk:
+                continue
+            buffered.extend(chunk)
+
+            frame_start = buffered.find(marker)
+            if frame_start < 0:
+                if len(buffered) > 1:
+                    del buffered[:-1]
+                continue
+            if len(buffered) - frame_start >= 16:
+                return bytes(buffered[frame_start:frame_start + 16])
+            if frame_start:
+                del buffered[:frame_start]
+
+        raise TimeoutError(
+            f"Response (opcode 0x{opcode:02X}) not received within {timeout_s}s"
+        )
     
     def set_id(self, id: int, current_limit: int):
         """This fn is used by the GUI to set actuator IDs and current limits for the first time."""
@@ -240,16 +277,13 @@ class AeroHand:
         if not (0 <= current_limit <= 1023):
             raise ValueError("current_limit must be in between 0..1023")
         
-        try:
+        with self._serial_lock:
             self.ser.reset_input_buffer()
-        except Exception:
-            pass
-
-        payload = [0] * 7
-        payload[0] = id & 0xFF   # stored in low byte of word0
-        payload[1] = current_limit & 0x03FF
-        self._send_data(SET_ID_MODE, payload)
-        payload = self._wait_for_ack(SET_ID_MODE, 5.0)
+            payload = [0] * 7
+            payload[0] = id & 0xFF   # stored in low byte of word0
+            payload[1] = current_limit & 0x03FF
+            self._send_data(SET_ID_MODE, payload)
+            payload = self._wait_for_ack(SET_ID_MODE, 5.0)
         old_id, new_id, cur_limit = struct.unpack_from("<HHH", payload, 0)
         return {"Old_id": old_id, "New_id": new_id, "Current_limit": cur_limit}
     
@@ -265,15 +299,13 @@ class AeroHand:
             raise ValueError("id must be 0..6")
         if not (0 <= speed <= 32766):
             raise ValueError("speed must be in range 0..32766")
-        try:
+        with self._serial_lock:
             self.ser.reset_input_buffer()
-        except Exception:
-            pass
-        payload = [0] * 7
-        payload[0] = id & 0xFFFF
-        payload[1] = speed & 0xFFFF
-        self._send_data(SET_SPE, payload)
-        payload = self._wait_for_ack(SET_SPE, 2.0)
+            payload = [0] * 7
+            payload[0] = id & 0xFFFF
+            payload[1] = speed & 0xFFFF
+            self._send_data(SET_SPE, payload)
+            payload = self._wait_for_ack(SET_SPE, 2.0)
         id, speed_val = struct.unpack_from("<HH", payload, 0)
         return {"Servo ID": id, "Speed": speed_val}
 
@@ -289,15 +321,13 @@ class AeroHand:
             raise ValueError("id must be 0..6")
         if not (0 <= torque <= 1000):
             raise ValueError("torque must be in range 0..1000")
-        try:
+        with self._serial_lock:
             self.ser.reset_input_buffer()
-        except Exception:
-            pass
-        payload = [0] * 7
-        payload[0] = id & 0xFFFF
-        payload[1] = torque & 0xFFFF
-        self._send_data(SET_TOR, payload)
-        payload = self._wait_for_ack(SET_TOR, 2.0)
+            payload = [0] * 7
+            payload[0] = id & 0xFFFF
+            payload[1] = torque & 0xFFFF
+            self._send_data(SET_TOR, payload)
+            payload = self._wait_for_ack(SET_TOR, 2.0)
         id, torque_val = struct.unpack_from("<HH", payload, 0)
         return {"Servo ID": id, "Torque": torque_val}
 
@@ -308,16 +338,13 @@ class AeroHand:
         if not (-360 <= degrees <= 360):
             raise ValueError("degrees out of range")
         
-        try:
+        with self._serial_lock:
             self.ser.reset_input_buffer()
-        except Exception:
-            pass
-
-        payload = [0] * 7
-        payload[0] = id & 0xFFFF
-        payload[1] = degrees & 0xFFFF  
-        self._send_data(TRIM_MODE, payload)
-        payload = self._wait_for_ack(TRIM_MODE, 2.0)
+            payload = [0] * 7
+            payload[0] = id & 0xFFFF
+            payload[1] = degrees & 0xFFFF
+            self._send_data(TRIM_MODE, payload)
+            payload = self._wait_for_ack(TRIM_MODE, 2.0)
         id, extend = struct.unpack_from("<HH", payload, 0)
         return {"Servo ID": id, "Extend Count": extend}
     
@@ -337,16 +364,32 @@ class AeroHand:
         assert len(payload) == 7, "Payload must be a list of 7 integers in Range 0-65535"
         assert all(0 <= v <= 65535 for v in payload), "Payload values must be in Range 0-65535"
         msg = struct.pack("<2B7H", header & 0xFF, 0x00, *(v & 0xFFFF for v in payload))
-        self.ser.write(msg)
-        self.ser.flush()
+        with self._serial_lock:
+            self.ser.write(msg)
+            self.ser.flush()
+
+    def _request_values(self, opcode: int, format_string: str, timeout_s: float = 1.0):
+        """Send a request and return the seven values from its matching reply."""
+        with self._serial_lock:
+            self.ser.reset_input_buffer()
+            self._send_data(opcode)
+            frame = self._read_frame(opcode, timeout_s)
+        return struct.unpack(format_string, frame)[2:]
+
+    def get_capabilities(self, timeout_s: float = 2.0) -> dict:
+        """Probe the ESP32 host protocol without moving any motors."""
+        values = self._request_values(GET_CAPS, "<2B7H", timeout_s)
+        return {
+            "protocol_version": values[0],
+            "flags": values[1],
+            "single_motor_speed": bool(values[1] & 0x0001),
+        }
 
     def send_homing(self, timeout_s: float = 175.0):
-        try:
+        with self._serial_lock:
             self.ser.reset_input_buffer()
-        except Exception:
-            pass
-        self._send_data(HOMING_MODE) 
-        payload = self._wait_for_ack(HOMING_MODE, timeout_s)
+            self._send_data(HOMING_MODE)
+            payload = self._wait_for_ack(HOMING_MODE, timeout_s)
         if all(b == 0 for b in payload):
             return True
         else:
@@ -385,26 +428,7 @@ class AeroHand:
         Returns:
             list: A list of 7 actuations. (degrees)
         """
-        ## Clear input buffer to avoid stale data
-        self.ser.reset_input_buffer()
-
-        try: 
-            self._send_data(GET_POS)
-        except SerialTimeoutException as e:
-            print(f"Error while writing to serial port: {e}")
-            return None
-
-        ## Read the response
-        resp = self.ser.read(2 + 7 * 2)  # 2
-        if len(resp) != 16:
-            print(f"Timeout while reading actuations. Got {len(resp)} bytes.")
-            return None
-        data = struct.unpack("<2B7H", resp)
-        if data[0] != GET_POS:
-            print(f"Invalid response from hand in get_actuations. Expected {GET_POS}, got {data[0]}")
-            self.ser.reset_input_buffer()
-            return None
-        positions_uint16 = data[2:]
+        positions_uint16 = self._request_values(GET_POS, "<2B7H")
         ## Convert to degrees
         positions = [
             self.actuation_lower_limits[i]
@@ -420,27 +444,9 @@ class AeroHand:
         Returns:
             list: A list of 7 actuator currents. (mA)
         """
-        ## Clear input buffer to avoid stale data
-        self.ser.reset_input_buffer()
-
-        try: 
-            self._send_data(GET_CURR)
-        except SerialTimeoutException as e:
-            print(f"Error while writing to serial port: {e}")
-            return None
-        
-        ## Read the response, signed values
-        resp = self.ser.read(2 + 7 * 2)  # 2
-        if len(resp) != 16:
-            print(f"Timeout while reading currents. Got {len(resp)} bytes.")
-            return None
-        data = struct.unpack("<2B7h", resp)
-        if data[0] != GET_CURR:
-            print(f"Invalid response from hand in get_actuator_currents. Expected {GET_CURR}, got {data[0]}")
-            self.ser.reset_input_buffer()
-            return None
         ## Convert to mA using the conversion factor 1 unit = 6.5 mA as per Feetech documentation
-        currents_mA = [val * 6.5 for val in data[2:]]
+        values = self._request_values(GET_CURR, "<2B7h")
+        currents_mA = [val * 6.5 for val in values]
         return currents_mA
 
     def get_actuator_temperatures(self):
@@ -449,26 +455,9 @@ class AeroHand:
         Returns:
             list: A list of 7 actuator temperatures. (Degree Celsius)
         """
-        self.ser.reset_input_buffer()
-
-        try: 
-            self._send_data(GET_TEMP)
-        except SerialTimeoutException as e:
-            print(f"Error while writing to serial port: {e}")
-            return None
-        
-        ## Read the response, unsigned values
-        resp = self.ser.read(2 + 7 * 2)  # 2
-        if len(resp) != 16:
-            print(f"Timeout while reading temperatures. Got {len(resp)} bytes.")
-            return None
-        data = struct.unpack("<2B7H", resp)
-        if data[0] != GET_TEMP:
-            print(f"Invalid response from hand in get_actuator_temperatures. Expected {GET_TEMP}, got {data[0]}")
-            self.ser.reset_input_buffer()
-            return None
         ## Temperatures are in degree Celsius directly
-        temperatures = [float(val) for val in data[2:]]
+        values = self._request_values(GET_TEMP, "<2B7H")
+        temperatures = [float(val) for val in values]
         return temperatures
 
     def get_actuator_speeds(self):
@@ -477,27 +466,11 @@ class AeroHand:
         Returns:
             list: A list of 7 actuator speeds. (RPM)
         """
-        self.ser.reset_input_buffer()
-
-        try: 
-            self._send_data(GET_VEL)
-        except SerialTimeoutException as e:
-            print(f"Error while writing to serial port: {e}")
-            return None
-        
-        ## Read the response, signed values
-        resp = self.ser.read(2 + 7 * 2)  # 2
-        if len(resp) != 16:
-            print(f"Timeout while reading speeds. Got {len(resp)} bytes.")
-            return None
-        data = struct.unpack("<2B7h", resp)
-        if data[0] != GET_VEL:
-            print(f"Invalid response from hand in get_actuator_speeds. Expected {GET_VEL}, got {data[0]}")
-            self.ser.reset_input_buffer()
-            return None
         ## Convert to RPM using the conversion factor 1 unit = 0.732 RPM as per Feetech documentation
-        speeds_rpm = [val * 0.732 for val in data[2:]]
+        values = self._request_values(GET_VEL, "<2B7h")
+        speeds_rpm = [val * 0.732 for val in values]
         return speeds_rpm
 
     def close(self):
-        self.ser.close()
+        with self._serial_lock:
+            self.ser.close()
