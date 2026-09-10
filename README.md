@@ -22,3 +22,6 @@ uv pip install -r requirements.txt
 uv run python3 main.py
 ```
 
+### 注意
+
+请使用新版固件，上位机的一些新功能不支持原版固件
