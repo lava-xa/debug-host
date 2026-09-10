@@ -117,9 +117,13 @@ class App(tk.Tk):
         self._main_thread = threading.current_thread()
         self._ui_queue = queue.Queue()
         self.control_paused = False  # pause streaming during blocking ops
+        self.active_control_mode = "position"
+        self.signed_batch_control_available = False
         self.tx_rate_hz = 50.0       # streaming rate for CTRL_POS
         self.slider_vars: list[tk.DoubleVar] = []  # Use DoubleVar for normalized 0.0-1.0 range
         self.slider_values = [0.0] * 7
+        self.speed_values = [0] * 7
+        self.torque_values = [0] * 7
         self.port_var = tk.StringVar()
         self.baud_var = tk.IntVar(value=921600)
 
@@ -292,14 +296,6 @@ class App(tk.Tk):
         self.btn_zero = ttk.Button(cmd, text="设为张开姿态", command=self.on_zero_all, state=tk.DISABLED)
         self.btn_zero.pack(side=tk.LEFT, padx=(0, 10))
 
-        #Set Speed Button
-        self.btn_set_speed = ttk.Button(cmd, text="设置速度", command=self.on_set_speed, state=tk.DISABLED)
-        self.btn_set_speed.pack(side=tk.LEFT, padx=(0, 10))
-
-        #Set Torque Button
-        self.btn_set_torque = ttk.Button(cmd, text="设置扭矩", command=self.on_set_torque, state=tk.DISABLED)
-        self.btn_set_torque.pack(side=tk.LEFT, padx=(0, 10))
-
         # GET buttons
         self.btn_get_pos  = ttk.Button(cmd, text="读取位置", command=self.on_get_pos,  state=tk.DISABLED)
         self.btn_get_vel  = ttk.Button(cmd, text="读取速度", command=self.on_get_vel,  state=tk.DISABLED)
@@ -335,12 +331,37 @@ class App(tk.Tk):
             max_lbl = ttk.Label(row, text="1.000", width=8, font=mono_font)
             max_lbl.pack(side=tk.LEFT)
 
+        # Seven-motor settings are placed directly below the last joint.
+        motor_settings = ttk.LabelFrame(self.grp, text="7 路电机参数", padding=(10, 8))
+        motor_settings.pack(fill=tk.X, pady=(10, 0))
+        self.btn_set_speed = ttk.Button(
+            motor_settings,
+            text="设置 7 路速度",
+            command=self.on_set_speed,
+            state=tk.DISABLED,
+        )
+        self.btn_set_speed.pack(side=tk.LEFT, padx=(0, 10))
+        self.btn_set_torque = ttk.Button(
+            motor_settings,
+            text="设置 7 路扭矩",
+            command=self.on_set_torque,
+            state=tk.DISABLED,
+        )
+        self.btn_set_torque.pack(side=tk.LEFT, padx=(0, 12))
+        self.btn_stop_direct = ttk.Button(
+            motor_settings,
+            text="停止并返回位置控制",
+            command=self.on_stop_direct_control,
+            state=tk.DISABLED,
+        )
+        self.btn_stop_direct.pack(side=tk.LEFT)
+
         # Torque slider (hidden by default)
         self.torque_frame = ttk.Frame(self)
         self.torque_slider_var = tk.DoubleVar(value=0.0)
-        self.torque_slider = tk.Scale(self.torque_frame, from_=0.0, to=1.0, orient=tk.HORIZONTAL, length=600,
+        self.torque_slider = tk.Scale(self.torque_frame, from_=-1.0, to=1.0, orient=tk.HORIZONTAL, length=600,
                                       resolution=0.001, variable=self.torque_slider_var, showvalue=True,
-                                      label="扭矩（0.000 - 1.000）", command=self._on_torque_slider)
+                                      label="扭矩（-1.000 – 1.000；正值逆时针）", command=self._on_torque_slider)
         self.torque_slider.pack(side=tk.LEFT, padx=20, pady=10)
         self.btn_back_joint = ttk.Button(self.torque_frame, text="返回位置控制", command=self.disable_torque_control)
         self.btn_back_joint.pack(side=tk.LEFT, padx=20, pady=10)
@@ -413,6 +434,134 @@ class App(tk.Tk):
     def _on_position_slider(self, index: int, value: str):
         self.slider_values[index] = float(value)
 
+    def _ask_motor_values(
+        self,
+        title: str,
+        parameter_name: str,
+        current_values: list[int],
+        minimum: int,
+        maximum: int,
+        direction_hint: str = "",
+    ) -> list[int] | None:
+        """在一个对话框中编辑 7 路电机参数。"""
+        dialog = tk.Toplevel(self, class_="AeroHandControl")
+        dialog.title(title)
+        dialog.transient(self)
+        dialog.resizable(False, False)
+
+        content = ttk.Frame(dialog, padding=16)
+        content.pack(fill=tk.BOTH, expand=True)
+        range_text = f"{parameter_name}范围：{minimum} – {maximum}"
+        if direction_hint:
+            range_text += f"；{direction_hint}"
+        ttk.Label(
+            content,
+            text=range_text,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        value_vars = []
+        for index, (motor_name, current_value) in enumerate(
+            zip(SLIDER_LABELS, current_values)
+        ):
+            ttk.Label(
+                content,
+                text=f"{index} – {motor_name}：",
+                width=18,
+            ).grid(row=index + 1, column=0, sticky="e", padx=(0, 8), pady=4)
+            value_var = tk.StringVar(value=str(current_value))
+            value_vars.append(value_var)
+            ttk.Spinbox(
+                content,
+                from_=minimum,
+                to=maximum,
+                textvariable=value_var,
+                width=14,
+            ).grid(row=index + 1, column=1, sticky="ew", pady=4)
+
+        result = None
+
+        def copy_first_to_all():
+            first_value = value_vars[0].get()
+            for value_var in value_vars[1:]:
+                value_var.set(first_value)
+
+        def apply_values():
+            nonlocal result
+            try:
+                values = [int(value_var.get()) for value_var in value_vars]
+            except ValueError:
+                messagebox.showerror("参数错误", "所有参数必须是整数。", parent=dialog)
+                return
+
+            invalid = [
+                index for index, value in enumerate(values)
+                if not minimum <= value <= maximum
+            ]
+            if invalid:
+                invalid_text = "、".join(str(index) for index in invalid)
+                messagebox.showerror(
+                    "参数超出范围",
+                    f"电机 {invalid_text} 的{parameter_name}必须介于 {minimum} 和 {maximum} 之间。",
+                    parent=dialog,
+                )
+                return
+
+            result = values
+            dialog.destroy()
+
+        actions = ttk.Frame(content)
+        actions.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        ttk.Button(
+            actions,
+            text="将 0 号值复制到全部",
+            command=copy_first_to_all,
+        ).pack(side=tk.LEFT)
+        ttk.Button(actions, text="取消", command=dialog.destroy).pack(side=tk.RIGHT)
+        ttk.Button(actions, text="应用到 7 路电机", command=apply_values).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
+
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.bind("<Return>", lambda _event: apply_values())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dialog.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dialog.grab_set()
+        self.wait_window(dialog)
+        return result
+
+    def _update_control_mode_ui(self):
+        """根据当前控制模式更新位置控件和停止按钮。"""
+        if threading.current_thread() is not self._main_thread:
+            self.call_in_ui(self._update_control_mode_ui)
+            return
+
+        is_position = self.active_control_mode == "position"
+        for scale in self.slider_widgets:
+            scale.configure(state=tk.NORMAL if is_position else tk.DISABLED)
+
+        titles = {
+            "position": "关节位置控制（发送 CTRL_POS 数据）",
+            "speed": "7 路有符号速度控制（CTRL_POS 已禁用）",
+            "torque": "7 路有符号扭矩控制（CTRL_POS 已禁用）",
+        }
+        self.grp.configure(text=titles[self.active_control_mode])
+        stop_state = (
+            tk.NORMAL
+            if self.hand is not None and not is_position
+            else tk.DISABLED
+        )
+        self.btn_stop_direct.configure(state=stop_state)
+
+    @staticmethod
+    def _send_direct_stop(hand: AeroHand, mode: str):
+        if mode == "speed":
+            hand.ctrl_speeds([0] * 7)
+        elif mode == "torque":
+            hand.ctrl_torque([0] * 7)
+
     @staticmethod
     def _port_rank(port):
         identity = " ".join(
@@ -459,22 +608,34 @@ class App(tk.Tk):
     def on_torque_control(self):
         if not self.hand:
             return
-        # Stop CTRL_POS streaming and disable joint sliders
+        if not self.signed_batch_control_available:
+            messagebox.showerror(
+                "固件版本过低",
+                "当前 ESP32 固件不支持有符号扭矩控制，请先烧录最新固件。",
+                parent=self,
+            )
+            return
         self.control_paused = True
-        self.set_status("已进入扭矩控制模式，CTRL_POS 位置数据发送已停止")
-        for scale in self.slider_widgets:
-            scale.configure(state=tk.DISABLED)
-        self.grp.configure(text="关节位置控制（CTRL_POS 已禁用）")
-        # Show torque slider
+        self.torque_values = [int(self.torque_slider_var.get() * 1000)] * 7
+        self.active_control_mode = "torque"
+        self._update_control_mode_ui()
         self.torque_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(6, 10))
         self.torque_slider.configure(state=tk.NORMAL)
+        try:
+            self.hand.ctrl_torque(list(self.torque_values))
+            self.set_status("已进入扭矩控制模式，CTRL_POS 位置数据发送已停止")
+        except Exception as e:
+            self.log(f"[错误] 扭矩控制失败：{e}")
+        finally:
+            self.control_paused = False
 
     def _on_torque_slider(self, val):
         if not self.hand:
             return
         t_val = int(float(val) * 1000)
+        self.torque_values = [t_val] * 7
         try:
-            self.hand.ctrl_torque([t_val]*7)
+            self.hand.ctrl_torque(list(self.torque_values))
             self.log(f"[发送] CTRL_TOR 扭矩值：{t_val}")
             self.set_status(f"扭矩已设置为 {t_val}")
         except Exception as e:
@@ -482,12 +643,8 @@ class App(tk.Tk):
             self.set_status("扭矩设置失败")
 
     def disable_torque_control(self):
-        # Hide torque slider and re-enable joint sliders
-        self.control_paused = False
         self.torque_frame.pack_forget()
-        for scale in self.slider_widgets:
-            scale.configure(state=tk.NORMAL)
-        self.grp.configure(text="关节位置控制（发送 CTRL_POS 数据）")
+        self.on_stop_direct_control()
 
     # ------------- connect/disconnect -------------
     def on_connect(self):
@@ -528,6 +685,13 @@ class App(tk.Tk):
             for var, value in zip(self.slider_vars, normalized):
                 var.set(value)
 
+            self.speed_values = [0] * 7
+            self.torque_values = [0] * 7
+            self.active_control_mode = "position"
+            self.signed_batch_control_available = capabilities[
+                "signed_batch_control"
+            ]
+
             self.hand = candidate
 
             self.stop_event.clear()
@@ -540,6 +704,13 @@ class App(tk.Tk):
                       self.btn_set_speed, self.btn_set_torque, self.btn_torque_control,
                       self.btn_get_pos, self.btn_get_vel, self.btn_get_cur, self.btn_get_temp, self.btn_get_all):
                 b.configure(state=tk.NORMAL)
+            self._update_control_mode_ui()
+
+            if not self.signed_batch_control_available:
+                self.btn_set_speed.configure(state=tk.DISABLED)
+                self.btn_set_torque.configure(state=tk.DISABLED)
+                self.btn_torque_control.configure(state=tk.DISABLED)
+                self.log("[警告] 当前固件不支持 7 路有符号速度/扭矩控制，请烧录最新 firmware_new 固件。")
 
             protocol_version = capabilities["protocol_version"]
             self.set_status(f"已连接 ESP32（固件协议 v{protocol_version}）：{port}")
@@ -567,6 +738,7 @@ class App(tk.Tk):
 
     def _shutdown_serial(self):
         self.control_paused = True
+        previous_mode = self.active_control_mode
         self.stop_event.set()
         if self.tx_thread and self.tx_thread.is_alive():
             try:
@@ -575,11 +747,17 @@ class App(tk.Tk):
                 pass
         if self.hand:
             try:
+                self._send_direct_stop(self.hand, previous_mode)
+            except Exception:
+                pass
+            try:
                 self.hand.close()
             except Exception:
                 pass
         self.hand = None
         self.tx_thread = None
+        self.active_control_mode = "position"
+        self.signed_batch_control_available = False
         self.control_paused = False
 
         self.btn_connect.configure(state=tk.NORMAL)
@@ -588,6 +766,8 @@ class App(tk.Tk):
                   self.btn_set_speed, self.btn_set_torque, self.btn_torque_control,
                   self.btn_get_pos, self.btn_get_vel, self.btn_get_cur, self.btn_get_temp, self.btn_get_all):
             b.configure(state=tk.DISABLED)
+        self.torque_frame.pack_forget()
+        self._update_control_mode_ui()
         self.set_status("未连接")
         self.log("[信息] 连接已断开")
 
@@ -597,16 +777,21 @@ class App(tk.Tk):
         next_t = time.perf_counter()
         while not self.stop_event.is_set():
             if self.hand is not None and not self.control_paused:
-                # ## Unnormalize to joint limits
-                j_ll = self.hand.joint_lower_limits
-                j_ul = self.hand.joint_upper_limits
-                slider_values = list(self.slider_values)
-                joint_values = [
-                    j_ll[i] + (j_ul[i] - j_ll[i]) * slider_values[i]
-                    for i in range(7)
-                ]
                 try:
-                    self.hand.set_joint_positions(joint_values)
+                    if self.active_control_mode == "speed":
+                        self.hand.ctrl_speeds(list(self.speed_values))
+                    elif self.active_control_mode == "torque":
+                        self.hand.ctrl_torque(list(self.torque_values))
+                    else:
+                        # Unnormalize to joint limits for CTRL_POS.
+                        j_ll = self.hand.joint_lower_limits
+                        j_ul = self.hand.joint_upper_limits
+                        slider_values = list(self.slider_values)
+                        joint_values = [
+                            j_ll[i] + (j_ul[i] - j_ll[i]) * slider_values[i]
+                            for i in range(7)
+                        ]
+                        self.hand.set_joint_positions(joint_values)
                 except Exception as e:
                     self.log(f"[发送错误] {e}")
             # pacing
@@ -668,26 +853,42 @@ class App(tk.Tk):
     def on_set_speed(self):
         if not self.hand:
             return
-        ch = simpledialog.askinteger("设置速度", "电机 ID / 通道（0..6）：",
-                                     minvalue=0, maxvalue=6, parent=self)
-        if ch is None:
+        if not self.signed_batch_control_available:
+            messagebox.showerror(
+                "固件版本过低",
+                "当前 ESP32 固件不支持 7 路有符号速度控制，请先烧录最新固件。",
+                parent=self,
+            )
             return
-        speed = simpledialog.askinteger("设置速度", "速度（0..32766）：",
-                                       minvalue=0, maxvalue=32766, initialvalue=32766, parent=self)
-        if speed is None:
+        values = self._ask_motor_values(
+            title="设置 7 路电机速度",
+            parameter_name="速度",
+            current_values=self.speed_values,
+            minimum=-32766,
+            maximum=32766,
+            direction_hint="正值=逆时针，负值=顺时针，0=停止",
+        )
+        if values is None:
             return
+
+        self.control_paused = True
+        hand = self.hand
 
         def worker():
             try:
-                self.control_paused = True
-                self.set_status("正在设置速度…等待应答")
-                self.log(f"[发送] SET_SPEED（通道={ch}，速度={speed}）")
-                ack = self.hand.set_speed(ch, speed)  # dict with Servo ID, Speed
-                self.log(f"[应答] SET_SPEED：ID={ack['Servo ID']}，速度={ack['Speed']}")
-                self.set_status("速度设置完成")
+                self.set_status("正在启用 7 路有符号速度控制…")
+                hand.ctrl_speeds(values)
+                self.speed_values = list(values)
+                self.active_control_mode = "speed"
+                self._update_control_mode_ui()
+                summary = "，".join(
+                    f"{index}={value}" for index, value in enumerate(values)
+                )
+                self.log(f"[发送] 7 路有符号速度：{summary}")
+                self.set_status("7 路速度控制中：正值逆时针，负值顺时针")
             except Exception as e:
-                self.log(f"[错误] SET_SPEED 失败：{e}")
-                self.set_status("速度设置失败")
+                self.log(f"[错误] 7 路速度控制失败：{e}")
+                self.set_status("7 路电机速度控制失败")
             finally:
                 self.control_paused = False
 
@@ -696,26 +897,70 @@ class App(tk.Tk):
     def on_set_torque(self):
         if not self.hand:
             return
-        ch = simpledialog.askinteger("设置扭矩", "电机 ID / 通道（0..6）：",
-                                     minvalue=0, maxvalue=6, parent=self)
-        if ch is None:
+        if not self.signed_batch_control_available:
+            messagebox.showerror(
+                "固件版本过低",
+                "当前 ESP32 固件不支持 7 路有符号扭矩控制，请先烧录最新固件。",
+                parent=self,
+            )
             return
-        torque = simpledialog.askinteger("设置扭矩", "扭矩（0..1000）：",
-                                        minvalue=0, maxvalue=1000, initialvalue=1000, parent=self)
-        if torque is None:
+        values = self._ask_motor_values(
+            title="设置 7 路电机扭矩",
+            parameter_name="扭矩",
+            current_values=self.torque_values,
+            minimum=-1000,
+            maximum=1000,
+            direction_hint="正值=逆时针，负值=顺时针，0=停止",
+        )
+        if values is None:
             return
+
+        self.control_paused = True
+        hand = self.hand
 
         def worker():
             try:
-                self.control_paused = True
-                self.set_status("正在设置扭矩…等待应答")
-                self.log(f"[发送] SET_TORQUE（通道={ch}，扭矩={torque}）")
-                ack = self.hand.set_torque(ch, torque)  # dict with Servo ID, Torque
-                self.log(f"[应答] SET_TORQUE：ID={ack['Servo ID']}，扭矩={ack['Torque']}")
-                self.set_status("扭矩设置完成")
+                self.set_status("正在启用 7 路有符号扭矩控制…")
+                hand.ctrl_torque(values)
+                self.torque_values = list(values)
+                self.active_control_mode = "torque"
+                self._update_control_mode_ui()
+                summary = "，".join(
+                    f"{index}={value}" for index, value in enumerate(values)
+                )
+                self.log(f"[发送] 7 路有符号扭矩：{summary}")
+                self.set_status("7 路扭矩控制中：正值逆时针，负值顺时针")
             except Exception as e:
-                self.log(f"[错误] SET_TORQUE 失败：{e}")
-                self.set_status("扭矩设置失败")
+                self.log(f"[错误] 7 路扭矩控制失败：{e}")
+                self.set_status("7 路电机扭矩控制失败")
+            finally:
+                self.control_paused = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_stop_direct_control(self):
+        if not self.hand:
+            return
+
+        self.control_paused = True
+        hand = self.hand
+        previous_mode = self.active_control_mode
+
+        def worker():
+            try:
+                self._send_direct_stop(hand, previous_mode)
+                if previous_mode == "speed":
+                    self.speed_values = [0] * 7
+                elif previous_mode == "torque":
+                    self.torque_values = [0] * 7
+                self.active_control_mode = "position"
+                self.call_in_ui(self.torque_frame.pack_forget)
+                self._update_control_mode_ui()
+                self.log("[发送] 7 路电机已停止，恢复 CTRL_POS 位置控制")
+                self.set_status("已停止速度/扭矩控制，返回位置控制")
+            except Exception as e:
+                self.log(f"[错误] 停止 7 路控制失败：{e}")
+                self.set_status("停止 7 路控制失败")
             finally:
                 self.control_paused = False
 
@@ -725,15 +970,21 @@ class App(tk.Tk):
         if not self.hand:
             return
 
+        self.control_paused = True
+        hand = self.hand
+        previous_mode = self.active_control_mode
         self.slider_values = [0.0] * 7
         for var in self.slider_vars:
             var.set(0.0)
 
         def worker():
             try:
-                self.control_paused = True
-                joint_pos = list(self.hand.joint_lower_limits)
-                self.hand.set_joint_positions(joint_pos)
+                self._send_direct_stop(hand, previous_mode)
+                self.active_control_mode = "position"
+                self.call_in_ui(self.torque_frame.pack_forget)
+                self._update_control_mode_ui()
+                joint_pos = list(hand.joint_lower_limits)
+                hand.set_joint_positions(joint_pos)
                 self.log("[发送] 通过 CTRL_POS 执行 ZERO_ALL（关节下限）")
                 self.set_status("已设为张开姿态（已发送关节下限并重置滑块）")
             except Exception as e:

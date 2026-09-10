@@ -32,6 +32,7 @@ TRIM_MODE = 0x03
 ## Command Modes
 CTRL_POS = 0x11
 CTRL_TOR = 0x12
+CTRL_SPE = 0x14
 
 ## Request Modes
 GET_ALL = 0x21
@@ -348,15 +349,31 @@ class AeroHand:
         id, extend = struct.unpack_from("<HH", payload, 0)
         return {"Servo ID": id, "Extend Count": extend}
     
-    def ctrl_torque(self, torque: list[int]):
+    def ctrl_speeds(self, speeds: list[int]):
+        """Control all seven motor speeds with signed values.
+
+        Positive values rotate counterclockwise, negative values rotate
+        clockwise, and zero stops the corresponding motor.
         """
-        Set the same torque value for all 7 servos using the CTRL_TOR command.
-        Args:
-            torque (list[int]): Torque values (0..1000)
+        if len(speeds) != 7:
+            raise ValueError("speeds must contain exactly 7 values")
+        if not all(-32766 <= speed <= 32766 for speed in speeds):
+            raise ValueError("all speeds must be in range -32766..32766")
+        payload = [speed & 0xFFFF for speed in speeds]
+        self._send_data(CTRL_SPE, payload)
+
+    def ctrl_torque(self, torques: list[int]):
         """
-        if not all(0 <= t <= 1000 for t in torque):
-            raise ValueError("torque must be in range 0..1000")
-        payload = [t & 0xFFFF for t in torque]
+        Control all seven motor torques with signed values.
+
+        Positive values apply counterclockwise torque, negative values apply
+        clockwise torque, and zero stops applying torque.
+        """
+        if len(torques) != 7:
+            raise ValueError("torques must contain exactly 7 values")
+        if not all(-1000 <= torque <= 1000 for torque in torques):
+            raise ValueError("all torques must be in range -1000..1000")
+        payload = [torque & 0xFFFF for torque in torques]
         self._send_data(CTRL_TOR, payload)
 
     def _send_data(self, header: int, payload: list[int] = [0] * 7):
@@ -383,6 +400,7 @@ class AeroHand:
             "protocol_version": values[0],
             "flags": values[1],
             "single_motor_speed": bool(values[1] & 0x0001),
+            "signed_batch_control": bool(values[1] & 0x0002),
         }
 
     def send_homing(self, timeout_s: float = 175.0):
