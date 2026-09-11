@@ -113,6 +113,7 @@ class App(tk.Tk):
         # runtime state
         self.hand: AeroHand | None = None
         self.tx_thread: threading.Thread | None = None
+        self.monitor_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
         self._main_thread = threading.current_thread()
         self._ui_queue = queue.Queue()
@@ -124,6 +125,10 @@ class App(tk.Tk):
         self.slider_values = [0.0] * 7
         self.speed_values = [0] * 7
         self.torque_values = [0] * 7
+        self.monitor_current_enabled = False
+        self.monitor_temperature_enabled = False
+        self.monitor_current_var = tk.BooleanVar(value=False)
+        self.monitor_temperature_var = tk.BooleanVar(value=False)
         self.port_var = tk.StringVar()
         self.baud_var = tk.IntVar(value=921600)
 
@@ -296,17 +301,35 @@ class App(tk.Tk):
         self.btn_zero = ttk.Button(cmd, text="设为张开姿态", command=self.on_zero_all, state=tk.DISABLED)
         self.btn_zero.pack(side=tk.LEFT, padx=(0, 10))
 
-        # GET buttons
-        self.btn_get_pos  = ttk.Button(cmd, text="读取位置", command=self.on_get_pos,  state=tk.DISABLED)
-        self.btn_get_vel  = ttk.Button(cmd, text="读取速度", command=self.on_get_vel,  state=tk.DISABLED)
-        self.btn_get_cur  = ttk.Button(cmd, text="读取电流", command=self.on_get_cur,  state=tk.DISABLED)
-        self.btn_get_temp = ttk.Button(cmd, text="读取温度", command=self.on_get_temp, state=tk.DISABLED)
-        self.btn_get_all  = ttk.Button(cmd, text="读取全部", command=self.on_get_all,  state=tk.DISABLED)
-        self.btn_get_pos.pack(side=tk.LEFT, padx=(20, 6))
+        # GET buttons and continuous monitoring options
+        telemetry = ttk.Frame(self, padding=(10, 4))
+        telemetry.pack(side=tk.TOP, fill=tk.X)
+        self.btn_get_pos  = ttk.Button(telemetry, text="读取位置", command=self.on_get_pos,  state=tk.DISABLED)
+        self.btn_get_vel  = ttk.Button(telemetry, text="读取速度", command=self.on_get_vel,  state=tk.DISABLED)
+        self.btn_get_cur  = ttk.Button(telemetry, text="读取电流", command=self.on_get_cur,  state=tk.DISABLED)
+        self.btn_get_temp = ttk.Button(telemetry, text="读取温度", command=self.on_get_temp, state=tk.DISABLED)
+        self.btn_get_all  = ttk.Button(telemetry, text="读取全部", command=self.on_get_all,  state=tk.DISABLED)
+        self.btn_get_pos.pack(side=tk.LEFT, padx=(0, 6))
         self.btn_get_vel.pack(side=tk.LEFT, padx=6)
         self.btn_get_cur.pack(side=tk.LEFT, padx=6)
         self.btn_get_temp.pack(side=tk.LEFT, padx=6)
         self.btn_get_all.pack(side=tk.LEFT, padx=6)
+        self.chk_monitor_current = ttk.Checkbutton(
+            telemetry,
+            text="持续电流（0.5s）",
+            variable=self.monitor_current_var,
+            command=self.on_monitor_options_changed,
+            state=tk.DISABLED,
+        )
+        self.chk_monitor_current.pack(side=tk.LEFT, padx=(12, 4))
+        self.chk_monitor_temperature = ttk.Checkbutton(
+            telemetry,
+            text="持续温度（0.5s）",
+            variable=self.monitor_temperature_var,
+            command=self.on_monitor_options_changed,
+            state=tk.DISABLED,
+        )
+        self.chk_monitor_temperature.pack(side=tk.LEFT, padx=4)
 
         # ---- Sliders (7)
         self.grp = ttk.LabelFrame(self, text="关节位置控制（发送 CTRL_POS 数据）", padding=10)
@@ -430,6 +453,72 @@ class App(tk.Tk):
             self.after(25, self._drain_ui_queue)
         except tk.TclError:
             pass
+
+    @staticmethod
+    def _format_indexed_values(values) -> str:
+        """将 7 路数据格式化为“0：数值  1：数值”。"""
+        formatted = []
+        for index, value in enumerate(values):
+            if isinstance(value, float):
+                value_text = f"{value:.3f}".rstrip("0").rstrip(".")
+            else:
+                value_text = str(value)
+            formatted.append(f"{index}：{value_text}")
+        return "  ".join(formatted)
+
+    def on_monitor_options_changed(self):
+        """同步界面复选框到后台监测状态。"""
+        if self.hand is None:
+            self.monitor_current_var.set(False)
+            self.monitor_temperature_var.set(False)
+        self.monitor_current_enabled = bool(self.monitor_current_var.get())
+        self.monitor_temperature_enabled = bool(
+            self.monitor_temperature_var.get()
+        )
+
+    def _monitor_loop(self):
+        """每 0.5 秒读取勾选的电流和温度数据。"""
+        last_errors = {"current": None, "temperature": None}
+        period = 0.5
+        next_t = time.perf_counter()
+
+        while not self.stop_event.is_set():
+            hand = self.hand
+            if hand is not None and self.monitor_current_enabled:
+                try:
+                    values = hand.get_actuator_currents()
+                    self.log(
+                        "[持续电流/mA] "
+                        + self._format_indexed_values(values)
+                    )
+                    last_errors["current"] = None
+                except Exception as e:
+                    error_text = str(e)
+                    if error_text != last_errors["current"]:
+                        self.log(f"[持续电流错误] {error_text}")
+                        last_errors["current"] = error_text
+
+            if hand is not None and self.monitor_temperature_enabled:
+                try:
+                    values = hand.get_actuator_temperatures()
+                    self.log(
+                        "[持续温度/℃] "
+                        + self._format_indexed_values(values)
+                    )
+                    last_errors["temperature"] = None
+                except Exception as e:
+                    error_text = str(e)
+                    if error_text != last_errors["temperature"]:
+                        self.log(f"[持续温度错误] {error_text}")
+                        last_errors["temperature"] = error_text
+
+            next_t += period
+            wait_time = next_t - time.perf_counter()
+            if wait_time <= 0:
+                next_t = time.perf_counter()
+                continue
+            if self.stop_event.wait(wait_time):
+                break
 
     def _on_position_slider(self, index: int, value: str):
         self.slider_values[index] = float(value)
@@ -697,9 +786,16 @@ class App(tk.Tk):
             self.stop_event.clear()
             self.tx_thread = threading.Thread(target=self._tx_loop, daemon=True)
             self.tx_thread.start()
+            self.monitor_thread = threading.Thread(
+                target=self._monitor_loop,
+                daemon=True,
+            )
+            self.monitor_thread.start()
 
             self.btn_connect.configure(state=tk.DISABLED)
             self.btn_disc.configure(state=tk.NORMAL)
+            self.chk_monitor_current.configure(state=tk.NORMAL)
+            self.chk_monitor_temperature.configure(state=tk.NORMAL)
             for b in (self.btn_zero, self.btn_homing, self.btn_setid, self.btn_trim,
                       self.btn_set_speed, self.btn_set_torque, self.btn_torque_control,
                       self.btn_get_pos, self.btn_get_vel, self.btn_get_cur, self.btn_get_temp, self.btn_get_all):
@@ -739,10 +835,19 @@ class App(tk.Tk):
     def _shutdown_serial(self):
         self.control_paused = True
         previous_mode = self.active_control_mode
+        self.monitor_current_enabled = False
+        self.monitor_temperature_enabled = False
+        self.monitor_current_var.set(False)
+        self.monitor_temperature_var.set(False)
         self.stop_event.set()
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            try:
+                self.monitor_thread.join(timeout=1.2)
+            except Exception:
+                pass
         if self.tx_thread and self.tx_thread.is_alive():
             try:
-                self.tx_thread.join(timeout=0.5)
+                self.tx_thread.join(timeout=1.2)
             except Exception:
                 pass
         if self.hand:
@@ -756,12 +861,15 @@ class App(tk.Tk):
                 pass
         self.hand = None
         self.tx_thread = None
+        self.monitor_thread = None
         self.active_control_mode = "position"
         self.signed_batch_control_available = False
         self.control_paused = False
 
         self.btn_connect.configure(state=tk.NORMAL)
         self.btn_disc.configure(state=tk.DISABLED)
+        self.chk_monitor_current.configure(state=tk.DISABLED)
+        self.chk_monitor_temperature.configure(state=tk.DISABLED)
         for b in (self.btn_zero, self.btn_homing, self.btn_setid, self.btn_trim,
                   self.btn_set_speed, self.btn_set_torque, self.btn_torque_control,
                   self.btn_get_pos, self.btn_get_vel, self.btn_get_cur, self.btn_get_temp, self.btn_get_all):
@@ -1054,7 +1162,9 @@ class App(tk.Tk):
             return
         try:
             vals = self.hand.get_actuator_currents()
-            self.log(f"[GET_CURR] {list(vals)}")
+            self.log(
+                "[GET_CURR/mA] " + self._format_indexed_values(vals)
+            )
         except Exception as e:
             self.log(f"[错误] GET_CURR：{e}")
 
@@ -1063,7 +1173,9 @@ class App(tk.Tk):
             return
         try:
             vals = self.hand.get_actuator_temperatures()
-            self.log(f"[GET_TEMP] {list(vals)}")
+            self.log(
+                "[GET_TEMP/℃] " + self._format_indexed_values(vals)
+            )
         except Exception as e:
             self.log(f"[错误] GET_TEMP：{e}")
     
@@ -1081,7 +1193,12 @@ class App(tk.Tk):
                 round((pos[i] - lower[i]) / (upper[i] - lower[i]), 3)
                 for i in range(7)
             ]
-            self.log(f"[GET_ALL] 位置：{norm_pos} | 速度：{list(vel)} | 电流：{list(curr)} | 温度：{list(temp)}")
+            current_text = self._format_indexed_values(curr)
+            temperature_text = self._format_indexed_values(temp)
+            self.log(
+                f"[GET_ALL] 位置：{norm_pos} | 速度：{list(vel)} | "
+                f"电流/mA：{current_text} | 温度/℃：{temperature_text}"
+            )
         except Exception as e:
             self.log(f"[错误] GET_ALL：{e}")
 
